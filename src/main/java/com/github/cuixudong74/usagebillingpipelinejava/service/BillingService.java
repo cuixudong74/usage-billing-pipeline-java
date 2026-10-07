@@ -87,45 +87,108 @@ public class BillingService {
         ReentrantLock lock = accountLocks.forAccount(accountId);
         lock.lock();
         try {
-            recoveryStateStore.put(new RecoveryState(
-                    accountId, start, end, "IN_PROGRESS", null, Instant.now(), actor.subject()));
-            Bill existing = billRepository.findCommitted(accountId, start, end).orElse(null);
-            if (existing != null) {
-                if (existing.status() == BillStatus.SUPERSEDED) {
-                    throw new ConflictException("Current bill is superseded; use correction");
-                }
-                recoveryStateStore.put(new RecoveryState(
-                        accountId, start, end, "COMMITTED", existing.billId(), Instant.now(), actor.subject()));
-                return existing;
-            }
-            Bill bill = calculate(accountId, start, end, 1, BillStatus.COMMITTED, idempotencyKey, null, actor);
-            Checkpoint checkpoint = new Checkpoint(
-                    accountId, start, end, bill.billId(), sourceEventIds(bill), Instant.now());
-            AuditEntry audit = new AuditEntry(
-                    UUID.randomUUID().toString(),
-                    accountId,
-                    actor.subject(),
-                    Action.COMMIT_BILL.name(),
-                    bill.billId(),
-                    Map.of(
-                            "planVersion", String.valueOf(bill.planVersion()),
-                            "planId", bill.planId(),
-                            "totalAmount", bill.totalAmount().toPlainString(),
-                            "sourceEventIds", String.join(",", sourceEventIds(bill)),
-                            "idempotencyKey", safeKey(idempotencyKey)),
-                    Instant.now());
-            stateStore.commit(state -> {
-                state.bills().put(bill.billId(), bill);
-                state.checkpoints().put(accountId + "|" + start + "|" + end, checkpoint);
-                state.audits().put(audit.auditId(), audit);
-                return state;
-            });
-            recoveryStateStore.put(new RecoveryState(
-                    accountId, start, end, "COMMITTED", bill.billId(), Instant.now(), actor.subject()));
-            return bill;
+            markInProgress(accountId, start, end, null, RecoveryState.OP_COMMIT, idempotencyKey, null, actor);
+            return commitWithinLock(accountId, start, end, idempotencyKey, actor);
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Commit pipeline that assumes the account lock is held and an IN_PROGRESS marker exists.
+     * Shared by the normal commit endpoint and by startup recovery of an interrupted commit, so
+     * both paths are guaranteed to be idempotent and never produce a second bill.
+     */
+    private Bill commitWithinLock(String accountId, Instant start, Instant end, String idempotencyKey, Actor actor) {
+        Bill existing = billRepository.findCommitted(accountId, start, end).orElse(null);
+        if (existing != null) {
+            markCommitted(accountId, start, end, existing.billId(), actor);
+            return existing;
+        }
+        Bill bill = calculate(accountId, start, end, 1, BillStatus.COMMITTED, idempotencyKey, null, actor);
+        Checkpoint checkpoint = new Checkpoint(
+                accountId, start, end, bill.billId(), sourceEventIds(bill), Instant.now());
+        AuditEntry audit = new AuditEntry(
+                UUID.randomUUID().toString(),
+                accountId,
+                actor == null ? "recovery" : actor.subject(),
+                Action.COMMIT_BILL.name(),
+                bill.billId(),
+                Map.of(
+                        "planVersion", String.valueOf(bill.planVersion()),
+                        "planId", bill.planId(),
+                        "totalAmount", bill.totalAmount().toPlainString(),
+                        "sourceEventIds", String.join(",", sourceEventIds(bill)),
+                        "idempotencyKey", safeKey(idempotencyKey)),
+                Instant.now());
+        stateStore.commit(state -> {
+            state.bills().put(bill.billId(), bill);
+            state.checkpoints().put(accountId + "|" + start + "|" + end, checkpoint);
+            state.audits().put(audit.auditId(), audit);
+            return state;
+        });
+        markCommitted(accountId, start, end, bill.billId(), actor);
+        return bill;
+    }
+
+    /**
+     * Resume an interrupted billing task after a restart. Idempotent:
+     * <ul>
+     *   <li>if a bill/checkpoint already exists, the window is simply marked COMMITTED;</li>
+     *   <li>otherwise the original COMMIT or ADJUST task is re-executed to completion;</li>
+     *   <li>already sealed windows are never recomputed or duplicated.</li>
+     * </ul>
+     */
+    public Bill resumeInterrupted(RecoveryState state) {
+        ReentrantLock lock = accountLocks.forAccount(state.accountId());
+        lock.lock();
+        try {
+            Actor actor = systemActor();
+            if (RecoveryState.OP_ADJUST.equals(state.operation())) {
+                // A correction must always be (re)evaluated: the late events are present but the
+                // replacement bill may never have been written. correctWithinLock is idempotent
+                // once the replacement already exists because findCommitted returns it and a
+                // no-difference recompute short-circuits.
+                Bill base = state.billId() == null ? null
+                        : billRepository.findById(state.billId()).orElse(null);
+                markInProgress(state.accountId(), state.windowStart(), state.windowEnd(), state.billId(),
+                        state.operation(), state.idempotencyKey(), state.reason(), actor);
+                return correctWithinLock(base, state.reason(), actor);
+            }
+            // COMMIT task: if the bill/checkpoint already landed, just finalize the marker.
+            Bill committed = billRepository.findCommitted(
+                    state.accountId(), state.windowStart(), state.windowEnd()).orElse(null);
+            if (committed != null) {
+                markCommitted(state.accountId(), state.windowStart(), state.windowEnd(),
+                        committed.billId(), actor);
+                return committed;
+            }
+            markInProgress(state.accountId(), state.windowStart(), state.windowEnd(), state.billId(),
+                    state.operation(), state.idempotencyKey(), state.reason(), actor);
+            return commitWithinLock(state.accountId(), state.windowStart(), state.windowEnd(),
+                    state.idempotencyKey(), actor);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void markInProgress(String accountId, Instant start, Instant end, String billId,
+                                String operation, String idempotencyKey, String reason, Actor actor) {
+        recoveryStateStore.put(new RecoveryState(
+                accountId, start, end, "IN_PROGRESS", billId, Instant.now(),
+                actor == null ? "system" : actor.subject(),
+                operation, idempotencyKey, reason));
+    }
+
+    private void markCommitted(String accountId, Instant start, Instant end, String billId, Actor actor) {
+        recoveryStateStore.put(new RecoveryState(
+                accountId, start, end, "COMMITTED", billId, Instant.now(),
+                actor == null ? "system" : actor.subject(),
+                RecoveryState.OP_COMMIT, null, null));
+    }
+
+    private Actor systemActor() {
+        return new Actor("recovery", java.util.Set.of("ADMIN"));
     }
 
     public Bill current(String accountId, Instant start, Instant end, Actor actor) {
@@ -147,106 +210,92 @@ public class BillingService {
         ReentrantLock lock = accountLocks.forAccount(current.accountId());
         lock.lock();
         try {
-            recoveryStateStore.put(new RecoveryState(
-                    current.accountId(),
-                    current.windowStart(),
-                    current.windowEnd(),
-                    "IN_PROGRESS",
-                    current.billId(),
-                    Instant.now(),
-                    actor.subject()));
-            Bill latest = billRepository.findCommitted(
-                    current.accountId(), current.windowStart(), current.windowEnd()).orElse(current);
-            Bill replacement = calculate(
-                    latest.accountId(),
-                    latest.windowStart(),
-                    latest.windowEnd(),
-                    latest.billVersion() + 1,
-                    BillStatus.ADJUSTED,
-                    latest.idempotencyKey(),
-                    latest.planVersion(),
-                    actor);
-            if (sameMoney(latest, replacement)) {
-                recoveryStateStore.put(new RecoveryState(
-                        latest.accountId(),
-                        latest.windowStart(),
-                        latest.windowEnd(),
-                        "COMMITTED",
-                        latest.billId(),
-                        Instant.now(),
-                        actor.subject()));
-                return latest;
-            }
-            BigDecimal delta = replacement.totalAmount().subtract(latest.totalAmount());
-            String checkpointKey = latest.accountId() + "|" + latest.windowStart() + "|" + latest.windowEnd();
-            Checkpoint checkpoint = new Checkpoint(
-                    latest.accountId(),
-                    latest.windowStart(),
-                    latest.windowEnd(),
-                    replacement.billId(),
-                    sourceEventIds(replacement),
-                    Instant.now());
-            Adjustment adjustment = new Adjustment(
-                    "adj-" + UUID.randomUUID(),
-                    latest.accountId(),
-                    latest.billId(),
-                    replacement.billId(),
-                    reason,
-                    delta,
-                    sourceEventIds(replacement),
-                    Instant.now(),
-                    actor.subject());
-            AuditEntry audit = new AuditEntry(
-                    UUID.randomUUID().toString(),
-                    latest.accountId(),
-                    actor.subject(),
-                    Action.ADJUST_BILL.name(),
-                    replacement.billId(),
-                    java.util.Map.of(
-                            "previousBillId", latest.billId(),
-                            "adjustmentId", adjustment.adjustmentId(),
-                            "previousAmount", latest.totalAmount().toPlainString(),
-                            "newAmount", replacement.totalAmount().toPlainString(),
-                            "amountDelta", delta.toPlainString(),
-                            "planId", replacement.planId(),
-                            "planVersion", String.valueOf(replacement.planVersion()),
-                            "sourceEventIds", String.join(",", sourceEventIds(replacement)),
-                            "reason", reason),
-                    Instant.now());
-            Bill superseded = new Bill(
-                    latest.billId(),
-                    latest.accountId(),
-                    latest.windowStart(),
-                    latest.windowEnd(),
-                    latest.billVersion(),
-                    BillStatus.SUPERSEDED,
-                    latest.planId(),
-                    latest.planVersion(),
-                    latest.lines(),
-                    latest.totalAmount(),
-                    latest.createdAt(),
-                    latest.createdBy(),
-                    latest.idempotencyKey());
-            stateStore.commit(state -> {
-                state.bills().put(superseded.billId(), superseded);
-                state.bills().put(replacement.billId(), replacement);
-                state.adjustments().put(adjustment.adjustmentId(), adjustment);
-                state.checkpoints().put(checkpointKey, checkpoint);
-                state.audits().put(audit.auditId(), audit);
-                return state;
-            });
-            recoveryStateStore.put(new RecoveryState(
-                    latest.accountId(),
-                    latest.windowStart(),
-                    latest.windowEnd(),
-                    "COMMITTED",
-                    replacement.billId(),
-                    Instant.now(),
-                    actor.subject()));
-            return replacement;
+            markInProgress(current.accountId(), current.windowStart(), current.windowEnd(),
+                    current.billId(), RecoveryState.OP_ADJUST, current.idempotencyKey(), reason, actor);
+            return correctWithinLock(current, reason, actor);
         } finally {
             lock.unlock();
         }
+    }
+
+    private Bill correctWithinLock(Bill current, String reason, Actor actor) {
+        Bill latest = billRepository.findCommitted(
+                current.accountId(), current.windowStart(), current.windowEnd()).orElse(current);
+        Bill replacement = calculate(
+                latest.accountId(),
+                latest.windowStart(),
+                latest.windowEnd(),
+                latest.billVersion() + 1,
+                BillStatus.ADJUSTED,
+                latest.idempotencyKey(),
+                latest.planVersion(),
+                actor);
+        if (sameMoney(latest, replacement)) {
+            markCommitted(latest.accountId(), latest.windowStart(), latest.windowEnd(),
+                    latest.billId(), actor);
+            return latest;
+        }
+        BigDecimal delta = replacement.totalAmount().subtract(latest.totalAmount());
+        String checkpointKey = latest.accountId() + "|" + latest.windowStart() + "|" + latest.windowEnd();
+        Checkpoint checkpoint = new Checkpoint(
+                latest.accountId(),
+                latest.windowStart(),
+                latest.windowEnd(),
+                replacement.billId(),
+                sourceEventIds(replacement),
+                Instant.now());
+        Adjustment adjustment = new Adjustment(
+                "adj-" + UUID.randomUUID(),
+                latest.accountId(),
+                latest.billId(),
+                replacement.billId(),
+                reason,
+                delta,
+                sourceEventIds(replacement),
+                Instant.now(),
+                actor == null ? "recovery" : actor.subject());
+        AuditEntry audit = new AuditEntry(
+                UUID.randomUUID().toString(),
+                latest.accountId(),
+                actor == null ? "recovery" : actor.subject(),
+                Action.ADJUST_BILL.name(),
+                replacement.billId(),
+                java.util.Map.of(
+                        "previousBillId", latest.billId(),
+                        "adjustmentId", adjustment.adjustmentId(),
+                        "previousAmount", latest.totalAmount().toPlainString(),
+                        "newAmount", replacement.totalAmount().toPlainString(),
+                        "amountDelta", delta.toPlainString(),
+                        "planId", replacement.planId(),
+                        "planVersion", String.valueOf(replacement.planVersion()),
+                        "sourceEventIds", String.join(",", sourceEventIds(replacement)),
+                        "reason", reason),
+                Instant.now());
+        Bill superseded = new Bill(
+                latest.billId(),
+                latest.accountId(),
+                latest.windowStart(),
+                latest.windowEnd(),
+                latest.billVersion(),
+                BillStatus.SUPERSEDED,
+                latest.planId(),
+                latest.planVersion(),
+                latest.lines(),
+                latest.totalAmount(),
+                latest.createdAt(),
+                latest.createdBy(),
+                latest.idempotencyKey());
+        stateStore.commit(state -> {
+            state.bills().put(superseded.billId(), superseded);
+            state.bills().put(replacement.billId(), replacement);
+            state.adjustments().put(adjustment.adjustmentId(), adjustment);
+            state.checkpoints().put(checkpointKey, checkpoint);
+            state.audits().put(audit.auditId(), audit);
+            return state;
+        });
+        markCommitted(latest.accountId(), latest.windowStart(), latest.windowEnd(),
+                replacement.billId(), actor);
+        return replacement;
     }
 
     private boolean sameMoney(Bill left, Bill right) {
@@ -275,7 +324,11 @@ public class BillingService {
         if (plan.effectiveTo() != null && plan.effectiveTo().isBefore(end)) {
             throw new ConflictException("Billing window crosses pricing version boundary at " + plan.effectiveTo());
         }
-        List<BillLine> lines = usage.values().stream()
+        // Line order is derived only from business keys (metric, dimensions), never from event
+        // arrival order or map iteration, so preview/commit/restart always produce the same lines.
+        List<BillLine> lines = usage.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(UsageAggregationService.METER_KEY_ORDER))
+                .map(Map.Entry::getValue)
                 .map(item -> pricingService.price(item, plan))
                 .toList();
         BigDecimal total = lines.stream().map(BillLine::netAmount).reduce(BigDecimal.ZERO, BigDecimal::add);

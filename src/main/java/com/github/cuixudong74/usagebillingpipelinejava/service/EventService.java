@@ -11,6 +11,7 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantLock;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -18,33 +19,48 @@ public class EventService {
     private final EventRepository eventRepository;
     private final AuthorizationService authorizationService;
     private final AuditService auditService;
+    private final AccountLocks accountLocks;
 
     public EventService(EventRepository eventRepository,
                         AuthorizationService authorizationService,
-                        AuditService auditService) {
+                        AuditService auditService,
+                        AccountLocks accountLocks) {
         this.eventRepository = eventRepository;
         this.authorizationService = authorizationService;
         this.auditService = auditService;
+        this.accountLocks = accountLocks;
     }
 
-    public synchronized UsageEvent ingest(UsageEvent event, Actor actor) {
+    public UsageEvent ingest(UsageEvent event, Actor actor) {
         validateActor(actor);
         validate(event);
         authorizationService.authorize(actor, Action.INGEST_EVENT, event.accountId());
-        var existing = eventRepository.findById(event.eventId());
-        if (existing.isPresent()) {
-            UsageEvent normalized = normalize(event);
-            if (!sameBusinessPayload(existing.get(), normalized)) {
-                throw new ConflictException("Duplicate event id " + event.eventId() + " has different payload");
+        UsageEvent normalized = normalize(event);
+        // Serialize ingestion within one account (deduplication must be race-free) while letting
+        // different accounts ingest concurrently.
+        ReentrantLock lock = accountLocks.forAccount(normalized.accountId());
+        lock.lock();
+        try {
+            var existing = eventRepository.findByAccountAndId(normalized.accountId(), normalized.eventId());
+            if (existing.isPresent()) {
+                if (!sameBusinessPayload(existing.get(), normalized)) {
+                    throw new ConflictException(
+                            "Event " + normalized.eventId() + " for account " + normalized.accountId()
+                                    + " was already received with a different business payload"
+                                    + " (metric/eventTime/quantity/dimensions must match on redelivery);"
+                                    + " duplicate is rejected");
+                }
+                return existing.get();
             }
-            return existing.get();
+            UsageEvent saved = eventRepository.save(normalized);
+            auditService.record(actor, Action.INGEST_EVENT, saved.accountId(), saved.eventId(), Map.of(
+                    "metric", saved.metric(),
+                    "eventTime", saved.eventTime().toString(),
+                    "quantity", saved.quantity().toPlainString()));
+            return saved;
+        } finally {
+            lock.unlock();
         }
-        UsageEvent saved = eventRepository.save(normalize(event));
-        auditService.record(actor, Action.INGEST_EVENT, saved.accountId(), saved.eventId(), Map.of(
-                "metric", saved.metric(),
-                "eventTime", saved.eventTime().toString(),
-                "quantity", saved.quantity().toPlainString()));
-        return saved;
     }
 
 

@@ -5,6 +5,7 @@ import com.github.cuixudong74.usagebillingpipelinejava.model.PricingPlanVersion;
 import com.github.cuixudong74.usagebillingpipelinejava.storage.JsonFileStore;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -20,11 +21,30 @@ public class FilePlanRepository implements PlanRepository {
         this.store = store;
         this.plans = store.readAll(TYPE, new TypeReference<>() {
         });
+        normalizeLegacyKeys();
+    }
+
+    /**
+     * Older builds keyed plans by {@code planId#version} without the account, so two accounts
+     * sharing the same plan id/version collided. Rewrite keys transparently on startup so existing
+     * plan data keeps working without a manual migration.
+     */
+    private synchronized void normalizeLegacyKeys() {
+        boolean needsRewrite = plans.entrySet().stream()
+                .anyMatch(entry -> !entry.getKey().equals(compositeKey(entry.getValue())));
+        if (!needsRewrite) {
+            return;
+        }
+        Map<String, PricingPlanVersion> normalized = new LinkedHashMap<>();
+        plans.values().forEach(plan -> normalized.putIfAbsent(compositeKey(plan), plan));
+        store.replaceAll(TYPE, normalized);
+        plans.clear();
+        plans.putAll(normalized);
     }
 
     @Override
     public synchronized PricingPlanVersion save(PricingPlanVersion plan) {
-        String id = plan.planId() + "#" + plan.version();
+        String id = compositeKey(plan);
         store.put(TYPE, id, plan);
         plans.put(id, plan);
         return plan;
@@ -53,5 +73,9 @@ public class FilePlanRepository implements PlanRepository {
                 .filter(plan -> plan.accountId().equals(accountId))
                 .sorted(Comparator.comparing(PricingPlanVersion::effectiveFrom).thenComparing(PricingPlanVersion::version))
                 .toList();
+    }
+
+    private static String compositeKey(PricingPlanVersion plan) {
+        return plan.accountId() + "|" + plan.planId() + "#" + plan.version();
     }
 }

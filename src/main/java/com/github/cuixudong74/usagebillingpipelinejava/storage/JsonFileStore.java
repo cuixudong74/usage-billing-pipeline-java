@@ -56,6 +56,40 @@ public JsonFileStore(Path directory, ObjectMapper objectMapper) {
         return mutate(type, values -> values.putIfAbsent(id, value));
     }
 
+    public <T> void replaceAll(String type, Map<String, T> values) {
+        lock.lock();
+        try {
+            writeAll(type, values);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private <T> void writeAll(String type, Map<String, T> values) {
+        Path file = file(type);
+        Path temp = null;
+        try {
+            temp = Files.createTempFile(directory, type + "-", ".tmp");
+            Files.writeString(temp, objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(values),
+                    StandardCharsets.UTF_8);
+            try {
+                Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot update " + type, e);
+        } finally {
+            if (temp != null) {
+                try {
+                    Files.deleteIfExists(temp);
+                } catch (IOException ignored) {
+                    // best effort temp cleanup
+                }
+            }
+        }
+    }
+
     private <T> T mutate(String type, java.util.function.Function<Map<String, T>, T> mutation) {
         lock.lock();
         try {

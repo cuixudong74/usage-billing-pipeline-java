@@ -7,22 +7,38 @@ import com.github.cuixudong74.usagebillingpipelinejava.model.UsageEvent;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.SortedMap;
 import java.util.TreeMap;
 import org.springframework.stereotype.Service;
 
 @Service
 public class UsageAggregationService {
-    public Map<MeterKey, UsageAggregate> aggregate(
+
+    /**
+     * Business-deterministic ordering of meter keys: metric first, then every dimension entry in
+     * key/value order. The account id is included as the final tie breaker so that results stay
+     * stable even if events from multiple accounts are aggregated together.
+     */
+    public static final Comparator<MeterKey> METER_KEY_ORDER = Comparator
+            .comparing(MeterKey::metric)
+            .thenComparing(key -> key.dimensions().entrySet().stream()
+                    .map(entry -> entry.getKey() + "=" + entry.getValue())
+                    .reduce("", (left, right) -> left + "|" + right))
+            .thenComparing(MeterKey::accountId);
+
+    public SortedMap<MeterKey, UsageAggregate> aggregate(
             Collection<UsageEvent> events, Instant windowStart, Instant windowEnd) {
         if (!windowStart.isBefore(windowEnd)) {
             throw new ValidationException("Window start must be before end");
         }
+        // Deduplicate inside a single account: different accounts may reuse the same eventId.
         Map<String, UsageEvent> unique = new LinkedHashMap<>();
         for (UsageEvent event : events) {
-            unique.putIfAbsent(event.eventId(), event);
+            unique.putIfAbsent(event.accountId() + "|" + event.eventId(), event);
         }
 
         Map<MeterKey, AggregationBuilder> grouped = new LinkedHashMap<>();
@@ -36,12 +52,9 @@ public class UsageAggregationService {
                     grouped.computeIfAbsent(key, AggregationBuilder::new).add(event);
                 });
 
-        Map<MeterKey, UsageAggregate> result = new TreeMap<>(Comparator
-                .comparing(MeterKey::accountId)
-                .thenComparing(MeterKey::metric)
-                .thenComparing(key -> key.dimensions().toString()));
+        SortedMap<MeterKey, UsageAggregate> result = new TreeMap<>(METER_KEY_ORDER);
         grouped.forEach((key, builder) -> result.put(key, builder.build()));
-        return Map.copyOf(result);
+        return Collections.unmodifiableSortedMap(result);
     }
 
     private static final class AggregationBuilder {

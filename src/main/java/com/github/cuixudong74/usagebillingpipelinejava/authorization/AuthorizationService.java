@@ -1,5 +1,6 @@
 package com.github.cuixudong74.usagebillingpipelinejava.authorization;
 
+import com.github.cuixudong74.usagebillingpipelinejava.exception.ForbiddenException;
 import com.github.cuixudong74.usagebillingpipelinejava.exception.ValidationException;
 import java.util.EnumSet;
 import java.util.Set;
@@ -31,7 +32,9 @@ public class AuthorizationService {
             case READ_AUDIT -> roles.contains(AUDITOR);
         };
         if (!allowed) {
-            throw new ValidationException("Actor " + actor.subject() + " is not allowed to " + action);
+            throw new ForbiddenException(
+                    "Access denied: actor " + actor.subject() + " is not authorized to " + action
+                            + (accountId == null ? "" : " for account " + accountId));
         }
     }
 

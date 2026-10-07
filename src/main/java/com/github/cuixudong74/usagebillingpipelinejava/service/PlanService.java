@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantLock;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -25,50 +26,58 @@ public class PlanService {
     private final com.github.cuixudong74.usagebillingpipelinejava.repository.PlanRepository planRepository;
     private final AuthorizationService authorizationService;
     private final AuditService auditService;
+    private final AccountLocks accountLocks;
 
     public PlanService(com.github.cuixudong74.usagebillingpipelinejava.repository.PlanRepository planRepository,
                        AuthorizationService authorizationService,
-                       AuditService auditService) {
+                       AuditService auditService,
+                       AccountLocks accountLocks) {
         this.planRepository = planRepository;
         this.authorizationService = authorizationService;
         this.auditService = auditService;
+        this.accountLocks = accountLocks;
     }
 
-    public synchronized PricingPlanVersion commit(PricingPlanVersion plan, Actor actor) {
+    public PricingPlanVersion commit(PricingPlanVersion plan, Actor actor) {
         if (plan == null) {
             throw new ValidationException("Plan is required");
         }
         authorizationService.authorize(actor, Action.COMMIT_PLAN, plan.accountId());
         validate(plan);
+        ReentrantLock lock = accountLocks.forAccount(plan.accountId());
+        lock.lock();
+        try {
+            var existing = planRepository.findByAccount(plan.accountId());
+            existing.stream()
+                    .filter(item -> item.version() == plan.version())
+                    .findAny()
+                    .ifPresent(item -> {
+                        throw new ConflictException("Plan version already exists");
+                    });
+            existing.stream()
+                    .filter(item -> overlaps(item, plan))
+                    .findAny()
+                    .ifPresent(item -> {
+                        throw new ConflictException("Plan effective period overlaps version " + item.version());
+                    });
 
-        var existing = planRepository.findByAccount(plan.accountId());
-        existing.stream()
-                .filter(item -> item.version() == plan.version())
-                .findAny()
-                .ifPresent(item -> {
-                    throw new ConflictException("Plan version already exists");
-                });
-        existing.stream()
-                .filter(item -> overlaps(item, plan))
-                .findAny()
-                .ifPresent(item -> {
-                    throw new ConflictException("Plan effective period overlaps version " + item.version());
-                });
-
-        PricingPlanVersion committed = new PricingPlanVersion(
-                plan.planId(),
-                plan.accountId(),
-                plan.version(),
-                plan.effectiveFrom(),
-                plan.effectiveTo(),
-                Instant.now(),
-                normalizeRules(plan.rules()));
-        planRepository.save(committed);
-        auditService.record(actor, Action.COMMIT_PLAN, committed.accountId(),
-                committed.planId() + "#" + committed.version(), Map.of(
-                        "effectiveFrom", committed.effectiveFrom().toString(),
-                        "ruleCount", String.valueOf(committed.rules().size())));
-        return committed;
+            PricingPlanVersion committed = new PricingPlanVersion(
+                    plan.planId(),
+                    plan.accountId(),
+                    plan.version(),
+                    plan.effectiveFrom(),
+                    plan.effectiveTo(),
+                    Instant.now(),
+                    normalizeRules(plan.rules()));
+            planRepository.save(committed);
+            auditService.record(actor, Action.COMMIT_PLAN, committed.accountId(),
+                    committed.planId() + "#" + committed.version(), Map.of(
+                            "effectiveFrom", committed.effectiveFrom().toString(),
+                            "ruleCount", String.valueOf(committed.rules().size())));
+            return committed;
+        } finally {
+            lock.unlock();
+        }
     }
 
 
