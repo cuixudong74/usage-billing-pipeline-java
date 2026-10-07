@@ -118,7 +118,8 @@ class BillingFlowTest {
         var authorizationService = new AuthorizationService();
         var auditService = new AuditService(auditRepository, authorizationService);
         var planService = new PlanService(planRepository, authorizationService, auditService);
-        var eventService = new EventService(eventRepository, authorizationService, auditService);
+        var eventService = new EventService(
+                eventRepository, authorizationService, auditService, new AccountLocks());
         var pricingService = new PricingService();
         var billingService = new BillingService(
                 eventRepository,

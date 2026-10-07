@@ -22,7 +22,7 @@ public class UsageAggregationService {
         }
         Map<String, UsageEvent> unique = new LinkedHashMap<>();
         for (UsageEvent event : events) {
-            unique.putIfAbsent(event.eventId(), event);
+            unique.putIfAbsent(uniqueKey(event), event);
         }
 
         Map<MeterKey, AggregationBuilder> grouped = new LinkedHashMap<>();
@@ -36,12 +36,13 @@ public class UsageAggregationService {
                     grouped.computeIfAbsent(key, AggregationBuilder::new).add(event);
                 });
 
-        Map<MeterKey, UsageAggregate> result = new TreeMap<>(Comparator
-                .comparing(MeterKey::accountId)
-                .thenComparing(MeterKey::metric)
-                .thenComparing(key -> key.dimensions().toString()));
+        Map<MeterKey, UsageAggregate> result = new TreeMap<>(MeterKey.businessOrder());
         grouped.forEach((key, builder) -> result.put(key, builder.build()));
         return Map.copyOf(result);
+    }
+
+    private static String uniqueKey(UsageEvent event) {
+        return event.accountId() + "|" + event.eventId();
     }
 
     private static final class AggregationBuilder {
@@ -54,7 +55,7 @@ public class UsageAggregationService {
         }
 
         private void add(UsageEvent event) {
-            events.putIfAbsent(event.eventId(), event);
+            events.putIfAbsent(uniqueKey(event), event);
             quantity = quantity.add(event.quantity());
         }
 

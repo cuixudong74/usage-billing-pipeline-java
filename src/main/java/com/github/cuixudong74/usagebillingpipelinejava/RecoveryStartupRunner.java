@@ -15,6 +15,15 @@ public class RecoveryStartupRunner implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        recoveryService.recover();
+        Thread recovery = new Thread(() -> {
+            try {
+                recoveryService.recover();
+            } catch (RuntimeException e) {
+                System.getLogger(RecoveryStartupRunner.class.getName())
+                        .log(System.Logger.Level.ERROR, "Startup recovery failed", e);
+            }
+        }, "billing-recovery-startup");
+        recovery.setDaemon(true);
+        recovery.start();
     }
 }

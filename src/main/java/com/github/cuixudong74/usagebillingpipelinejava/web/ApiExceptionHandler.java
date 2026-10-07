@@ -1,6 +1,7 @@
 package com.github.cuixudong74.usagebillingpipelinejava.web;
 
 import com.github.cuixudong74.usagebillingpipelinejava.exception.ConflictException;
+import com.github.cuixudong74.usagebillingpipelinejava.exception.ForbiddenException;
 import com.github.cuixudong74.usagebillingpipelinejava.exception.NotFoundException;
 import com.github.cuixudong74.usagebillingpipelinejava.exception.ValidationException;
 import java.time.Instant;
@@ -12,6 +13,11 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 @RestControllerAdvice
 public class ApiExceptionHandler {
+    @ExceptionHandler(ForbiddenException.class)
+    public ResponseEntity<Map<String, Object>> forbidden(ForbiddenException e) {
+        return response(HttpStatus.FORBIDDEN, e.getMessage());
+    }
+
     @ExceptionHandler(ValidationException.class)
     public ResponseEntity<Map<String, Object>> validation(ValidationException e) {
         return response(HttpStatus.BAD_REQUEST, e.getMessage());

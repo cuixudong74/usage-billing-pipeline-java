@@ -6,7 +6,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 /**
  * @version 1.0
  */
-@SpringBootTest
+@SpringBootTest(properties = "billing.data-dir=target/application-context-test-data")
 public class ApplicationTests {
     @Test
     public void contentLoad() {

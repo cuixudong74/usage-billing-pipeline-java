@@ -7,7 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.cuixudong74.usagebillingpipelinejava.authorization.Actor;
 import com.github.cuixudong74.usagebillingpipelinejava.authorization.AuthorizationService;
-import com.github.cuixudong74.usagebillingpipelinejava.exception.ValidationException;
+import com.github.cuixudong74.usagebillingpipelinejava.exception.ForbiddenException;
 import com.github.cuixudong74.usagebillingpipelinejava.model.Bill;
 import com.github.cuixudong74.usagebillingpipelinejava.model.PricingPlanVersion;
 import com.github.cuixudong74.usagebillingpipelinejava.model.PricingRule;
@@ -95,7 +95,7 @@ class ConcurrencyAndAuthorizationTest {
     void unauthorizedActorCannotCommitPlan() {
         AuthorizationService authorizationService = new AuthorizationService();
         Actor eventWriter = new Actor("writer", Set.of("EVENT_WRITER"));
-        assertThrows(ValidationException.class,
+        assertThrows(ForbiddenException.class,
                 () -> authorizationService.authorize(eventWriter,
                         com.github.cuixudong74.usagebillingpipelinejava.authorization.Action.COMMIT_PLAN, "acct"));
     }
@@ -114,7 +114,8 @@ class ConcurrencyAndAuthorizationTest {
         var authorizationService = new AuthorizationService();
         var auditService = new AuditService(auditRepository, authorizationService);
         var planService = new PlanService(planRepository, authorizationService, auditService);
-        var eventService = new EventService(eventRepository, authorizationService, auditService);
+        var eventService = new EventService(
+                eventRepository, authorizationService, auditService, new AccountLocks());
         var billingService = new BillingService(
                 eventRepository, billRepository,
                 billingStateStore, recoveryStateStore, planService,

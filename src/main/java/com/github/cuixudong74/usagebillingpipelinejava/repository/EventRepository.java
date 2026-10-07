@@ -5,7 +5,7 @@ import java.util.List;
 import java.util.Optional;
 
 public interface EventRepository {
-    Optional<UsageEvent> findById(String eventId);
+    Optional<UsageEvent> findByAccountAndEventId(String accountId, String eventId);
     UsageEvent save(UsageEvent event);
     List<UsageEvent> findByAccount(String accountId);
 }

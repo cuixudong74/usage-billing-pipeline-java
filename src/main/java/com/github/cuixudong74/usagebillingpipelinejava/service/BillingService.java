@@ -23,8 +23,11 @@ import com.github.cuixudong74.usagebillingpipelinejava.storage.BillingStateStore
 import com.github.cuixudong74.usagebillingpipelinejava.storage.RecoveryStateStore;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
 import org.springframework.stereotype.Service;
@@ -123,6 +126,36 @@ public class BillingService {
             recoveryStateStore.put(new RecoveryState(
                     accountId, start, end, "COMMITTED", bill.billId(), Instant.now(), actor.subject()));
             return bill;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void resumeInterrupted(RecoveryState state) {
+        if (!Set.of("IN_PROGRESS", "INTERRUPTED").contains(state.status())) {
+            return;
+        }
+
+        ReentrantLock lock = accountLocks.forAccount(state.accountId());
+        lock.lock();
+        try {
+            RecoveryState current = recoveryStateStore.load()
+                    .getOrDefault(RecoveryStateStore.key(state.accountId(), state.windowStart(), state.windowEnd()), state);
+            if (!Set.of("IN_PROGRESS", "INTERRUPTED").contains(current.status())) {
+                return;
+            }
+
+            Optional<Bill> committed = billRepository.findCommitted(
+                    current.accountId(), current.windowStart(), current.windowEnd());
+            if (current.billId() == null) {
+                if (committed.isPresent()) {
+                    markRecovered(current, committed.get());
+                    return;
+                }
+                resumeCommit(current);
+            } else {
+                resumeAdjustment(current, committed.orElse(null));
+            }
         } finally {
             lock.unlock();
         }
@@ -249,6 +282,60 @@ public class BillingService {
         }
     }
 
+    private void resumeCommit(RecoveryState state) {
+        commit(state.accountId(), state.windowStart(), state.windowEnd(), null, systemActor());
+    }
+
+    private void resumeAdjustment(RecoveryState state, Bill committed) {
+        Bill original = stateStore.load().bills().get(state.billId());
+        if (original == null) {
+            if (committed != null) {
+                markRecovered(state, committed);
+                return;
+            }
+            throw new IllegalStateException("Cannot recover adjustment: original bill is missing " + state.billId());
+        }
+
+        if (original.status() == BillStatus.SUPERSEDED) {
+            Bill replacement = committed == null
+                    ? billRepository.findById(findReplacementBillId(original)).orElseThrow(() ->
+                            new IllegalStateException("Cannot find replacement bill for " + original.billId()))
+                    : committed;
+            markRecovered(state, replacement);
+            return;
+        }
+
+        if (committed != null && !committed.billId().equals(original.billId())) {
+            markRecovered(state, committed);
+            return;
+        }
+
+        correct(original, "Automatic recovery after interrupted correction", systemActor());
+    }
+
+    private String findReplacementBillId(Bill original) {
+        return stateStore.load().adjustments().values().stream()
+                .filter(adjustment -> adjustment.originalBillId().equals(original.billId()))
+                .map(adjustment -> adjustment.replacementBillId())
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Cannot find replacement bill for " + original.billId()));
+    }
+
+    private void markRecovered(RecoveryState state, Bill bill) {
+        recoveryStateStore.put(new RecoveryState(
+                state.accountId(),
+                state.windowStart(),
+                state.windowEnd(),
+                "COMMITTED",
+                bill.billId(),
+                Instant.now(),
+                "recovery"));
+    }
+
+    private Actor systemActor() {
+        return new Actor("system", Set.of("ADMIN"));
+    }
+
     private boolean sameMoney(Bill left, Bill right) {
         return left.totalAmount().compareTo(right.totalAmount()) == 0
                 && left.lines().size() == right.lines().size()
@@ -276,6 +363,7 @@ public class BillingService {
             throw new ConflictException("Billing window crosses pricing version boundary at " + plan.effectiveTo());
         }
         List<BillLine> lines = usage.values().stream()
+                .sorted(Comparator.comparing(UsageAggregate::key, MeterKey.businessOrder()))
                 .map(item -> pricingService.price(item, plan))
                 .toList();
         BigDecimal total = lines.stream().map(BillLine::netAmount).reduce(BigDecimal.ZERO, BigDecimal::add);

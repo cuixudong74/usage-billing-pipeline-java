@@ -24,8 +24,15 @@ public class FilePlanRepository implements PlanRepository {
 
     @Override
     public synchronized PricingPlanVersion save(PricingPlanVersion plan) {
-        String id = plan.planId() + "#" + plan.version();
-        store.put(TYPE, id, plan);
+        String id = primaryKey(plan);
+        String legacyId = plan.planId() + "#" + plan.version();
+        PricingPlanVersion legacy = plans.get(legacyId);
+        if (legacy != null && plan.accountId().equals(legacy.accountId())) {
+            store.replace(TYPE, legacyId, id, plan);
+            plans.remove(legacyId);
+        } else {
+            store.put(TYPE, id, plan);
+        }
         plans.put(id, plan);
         return plan;
     }
@@ -51,7 +58,12 @@ public class FilePlanRepository implements PlanRepository {
     public synchronized List<PricingPlanVersion> findByAccount(String accountId) {
         return plans.values().stream()
                 .filter(plan -> plan.accountId().equals(accountId))
-                .sorted(Comparator.comparing(PricingPlanVersion::effectiveFrom).thenComparing(PricingPlanVersion::version))
+                .sorted(Comparator.comparing(PricingPlanVersion::effectiveFrom)
+                        .thenComparing(PricingPlanVersion::version))
                 .toList();
+    }
+
+    private String primaryKey(PricingPlanVersion plan) {
+        return plan.accountId().length() + ":" + plan.accountId() + "|" + plan.planId() + "#" + plan.version();
     }
 }

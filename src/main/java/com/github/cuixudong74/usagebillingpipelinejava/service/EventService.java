@@ -11,6 +11,7 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.locks.ReentrantLock;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -18,33 +19,44 @@ public class EventService {
     private final EventRepository eventRepository;
     private final AuthorizationService authorizationService;
     private final AuditService auditService;
+    private final AccountLocks accountLocks;
 
     public EventService(EventRepository eventRepository,
                         AuthorizationService authorizationService,
-                        AuditService auditService) {
+                        AuditService auditService,
+                        AccountLocks accountLocks) {
         this.eventRepository = eventRepository;
         this.authorizationService = authorizationService;
         this.auditService = auditService;
+        this.accountLocks = accountLocks;
     }
 
-    public synchronized UsageEvent ingest(UsageEvent event, Actor actor) {
+    public UsageEvent ingest(UsageEvent event, Actor actor) {
         validateActor(actor);
         validate(event);
         authorizationService.authorize(actor, Action.INGEST_EVENT, event.accountId());
-        var existing = eventRepository.findById(event.eventId());
-        if (existing.isPresent()) {
-            UsageEvent normalized = normalize(event);
-            if (!sameBusinessPayload(existing.get(), normalized)) {
-                throw new ConflictException("Duplicate event id " + event.eventId() + " has different payload");
+        ReentrantLock lock = accountLocks.forAccount(event.accountId());
+        lock.lock();
+        try {
+            var existing = eventRepository.findByAccountAndEventId(event.accountId(), event.eventId());
+            if (existing.isPresent()) {
+                UsageEvent normalized = normalize(event);
+                if (!sameBusinessPayload(existing.get(), normalized)) {
+                    throw new ConflictException(
+                            "Duplicate eventId " + event.eventId() + " for account " + event.accountId()
+                                    + " has different business payload");
+                }
+                return existing.get();
             }
-            return existing.get();
+            UsageEvent saved = eventRepository.save(normalize(event));
+            auditService.record(actor, Action.INGEST_EVENT, saved.accountId(), saved.eventId(), Map.of(
+                    "metric", saved.metric(),
+                    "eventTime", saved.eventTime().toString(),
+                    "quantity", saved.quantity().toPlainString()));
+            return saved;
+        } finally {
+            lock.unlock();
         }
-        UsageEvent saved = eventRepository.save(normalize(event));
-        auditService.record(actor, Action.INGEST_EVENT, saved.accountId(), saved.eventId(), Map.of(
-                "metric", saved.metric(),
-                "eventTime", saved.eventTime().toString(),
-                "quantity", saved.quantity().toPlainString()));
-        return saved;
     }
 
 
@@ -63,10 +75,12 @@ public class EventService {
     }
 
     private void validate(UsageEvent event) {
-        require(event != null, "Event is required");
-        require(!event.eventId().isBlank(), "eventId is required");
-        require(!event.accountId().isBlank(), "accountId is required");
-        require(!event.metric().isBlank(), "metric is required");
+        if (event == null) {
+            throw new ValidationException("Event is required");
+        }
+        require(event.eventId() != null && !event.eventId().isBlank(), "eventId is required");
+        require(event.accountId() != null && !event.accountId().isBlank(), "accountId is required");
+        require(event.metric() != null && !event.metric().isBlank(), "metric is required");
         require(event.eventTime() != null, "eventTime is required");
         require(event.quantity() != null && event.quantity().signum() >= 0, "quantity must be non-negative");
         require(event.dimensions() != null, "dimensions are required");

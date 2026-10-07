@@ -56,6 +56,18 @@ public JsonFileStore(Path directory, ObjectMapper objectMapper) {
         return mutate(type, values -> values.putIfAbsent(id, value));
     }
 
+    public <T> T remove(String type, String id) {
+        return mutate(type, values -> values.remove(id));
+    }
+
+    public <T> T replace(String type, String oldId, String newId, T value) {
+        return mutate(type, values -> {
+            values.remove(oldId);
+            values.put(newId, value);
+            return value;
+        });
+    }
+
     private <T> T mutate(String type, java.util.function.Function<Map<String, T>, T> mutation) {
         lock.lock();
         try {

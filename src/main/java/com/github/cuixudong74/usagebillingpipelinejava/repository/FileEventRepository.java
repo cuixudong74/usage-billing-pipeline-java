@@ -22,18 +22,35 @@ public class FileEventRepository implements EventRepository {
     }
 
     @Override
-    public synchronized Optional<UsageEvent> findById(String eventId) {
-        return Optional.ofNullable(events.get(eventId));
+    public synchronized Optional<UsageEvent> findByAccountAndEventId(String accountId, String eventId) {
+        UsageEvent canonical = events.get(primaryKey(accountId, eventId));
+        if (canonical != null) {
+            return Optional.of(canonical);
+        }
+
+        UsageEvent legacy = events.get(eventId);
+        if (legacy != null && accountId.equals(legacy.accountId())) {
+            return Optional.of(legacy);
+        }
+        return Optional.empty();
     }
 
     @Override
     public synchronized UsageEvent save(UsageEvent event) {
-        UsageEvent existing = events.get(event.eventId());
+        String key = primaryKey(event.accountId(), event.eventId());
+        UsageEvent existing = events.get(key);
         if (existing != null) {
             return existing;
         }
-        store.put(TYPE, event.eventId(), event);
-        events.put(event.eventId(), event);
+
+        UsageEvent legacy = events.get(event.eventId());
+        if (legacy != null && event.accountId().equals(legacy.accountId())) {
+            store.replace(TYPE, event.eventId(), key, event);
+            events.remove(event.eventId());
+        } else {
+            store.put(TYPE, key, event);
+        }
+        events.put(key, event);
         return event;
     }
 
@@ -43,5 +60,9 @@ public class FileEventRepository implements EventRepository {
                 .filter(event -> event.accountId().equals(accountId))
                 .map(UsageEvent.class::cast)
                 .toList();
+    }
+
+    private String primaryKey(String accountId, String eventId) {
+        return accountId.length() + ":" + accountId + "|" + eventId;
     }
 }

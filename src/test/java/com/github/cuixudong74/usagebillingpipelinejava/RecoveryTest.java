@@ -1,6 +1,7 @@
 package com.github.cuixudong74.usagebillingpipelinejava;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.cuixudong74.usagebillingpipelinejava.authorization.Actor;
@@ -59,19 +60,22 @@ class RecoveryTest {
         var authorization = new AuthorizationService();
         var auditService = new AuditService(audits, authorization);
         var planService = new PlanService(plans, authorization, auditService);
-        var eventService = new EventService(events, authorization, auditService);
+        var accountLocks = new AccountLocks();
+        var eventService = new EventService(events, authorization, auditService, accountLocks);
         var billingService = new BillingService(
                 events, bills, billingStateStore, recoveryStateStore,
                 planService, new UsageAggregationService(), new PricingService(),
-                authorization, auditService, new AccountLocks());
-        var recoveryService = new RecoveryService(recoveryStateStore, checkpoints);
+                authorization, auditService, accountLocks);
+        var recoveryService = new RecoveryService(recoveryStateStore, billingService);
         planService.commit(new com.github.cuixudong74.usagebillingpipelinejava.model.PricingPlanVersion(
-                "plan", "acct", 1, JAN, null, Instant.now(),
+                "plan", "aborted", 1, JAN, null, Instant.now(),
                 List.of(new com.github.cuixudong74.usagebillingpipelinejava.model.PricingRule(
                         "api_calls", new TreeMap<>(),
                         List.of(new com.github.cuixudong74.usagebillingpipelinejava.model.PricingTier(
                                 null, BigDecimal.ONE)), null, null, null))), ADMIN);
 
+        eventService.ingest(new UsageEvent("e1", "aborted", "api_calls",
+                Instant.parse("2026-01-02T00:00:00Z"), Instant.now(), BigDecimal.ONE, new TreeMap<>()), ADMIN);
         recoveryStateStore.put(new RecoveryState("aborted", JAN, FEB, "IN_PROGRESS", null,
                 Instant.now(), "biller"));
         eventService.ingest(new UsageEvent("e1", "committed", "api_calls",
@@ -88,9 +92,64 @@ class RecoveryTest {
 
         Map<String, String> status = recoveryService.recover();
 
-        assertEquals("INTERRUPTED", status.get(RecoveryStateStore.key("aborted", JAN, FEB)));
+        assertEquals("COMMITTED", status.get(RecoveryStateStore.key("aborted", JAN, FEB)));
         assertEquals("COMMITTED", status.get(RecoveryStateStore.key("committed", JAN, FEB)));
+        assertEquals(1, bills.findByAccount("aborted").size());
         assertEquals(1, bills.findByAccount("committed").size());
+        assertEquals(new BigDecimal("1.00"),
+                bills.findByAccount("aborted").get(0).totalAmount());
         assertEquals(committed.totalAmount(), bills.findById(committed.billId()).orElseThrow().totalAmount());
+    }
+
+    @Test
+    void interruptedCorrectionAutomaticallyCompletesWithoutDoubleCharging() {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        Path directory = tempDir.resolve("correction");
+        JsonFileStore jsonStore = new JsonFileStore(directory.resolve("json"), mapper);
+        BillingStateStore billingStateStore = new BillingStateStore(directory.resolve("state/billing.json"), mapper);
+        RecoveryStateStore recoveryStateStore = new RecoveryStateStore(directory.resolve("state/recovery.json"), mapper);
+        var events = new FileEventRepository(jsonStore);
+        var plans = new FilePlanRepository(jsonStore);
+        var bills = new FileBillRepository(billingStateStore);
+        var audits = new FileAuditRepository(billingStateStore);
+        var authorization = new AuthorizationService();
+        var auditService = new AuditService(audits, authorization);
+        var planService = new PlanService(plans, authorization, auditService);
+        var accountLocks = new AccountLocks();
+        var eventService = new EventService(events, authorization, auditService, accountLocks);
+        var billingService = new BillingService(
+                events, bills, billingStateStore, recoveryStateStore,
+                planService, new UsageAggregationService(), new PricingService(),
+                authorization, auditService, accountLocks);
+        var recoveryService = new RecoveryService(recoveryStateStore, billingService);
+        planService.commit(new com.github.cuixudong74.usagebillingpipelinejava.model.PricingPlanVersion(
+                "plan", "acct", 1, JAN, null, Instant.now(),
+                List.of(new com.github.cuixudong74.usagebillingpipelinejava.model.PricingRule(
+                        "api_calls", new TreeMap<>(),
+                        List.of(new com.github.cuixudong74.usagebillingpipelinejava.model.PricingTier(
+                                null, BigDecimal.ONE)), null, null, null))), ADMIN);
+        eventService.ingest(new UsageEvent("e1", "acct", "api_calls",
+                Instant.parse("2026-01-02T00:00:00Z"), Instant.now(), BigDecimal.ONE, new TreeMap<>()), ADMIN);
+        Bill original = billingService.commit("acct", JAN, FEB, "original", ADMIN);
+
+        eventService.ingest(new UsageEvent("e2", "acct", "api_calls",
+                Instant.parse("2026-01-03T00:00:00Z"), Instant.now(), BigDecimal.ONE, new TreeMap<>()), ADMIN);
+        recoveryStateStore.put(new RecoveryState("acct", JAN, FEB, "IN_PROGRESS",
+                original.billId(), Instant.now(), "biller"));
+
+        Map<String, String> firstRecovery = recoveryService.recover();
+        Bill adjusted = billingService.current("acct", JAN, FEB, ADMIN);
+        Map<String, String> secondRecovery = recoveryService.recover();
+        Bill afterSecondRecovery = billingService.current("acct", JAN, FEB, ADMIN);
+
+        assertEquals("COMMITTED", firstRecovery.get(RecoveryStateStore.key("acct", JAN, FEB)));
+        assertNotEquals(original.billId(), adjusted.billId());
+        assertEquals(com.github.cuixudong74.usagebillingpipelinejava.model.BillStatus.ADJUSTED, adjusted.status());
+        assertEquals(new BigDecimal("2.00"), adjusted.totalAmount());
+        assertEquals(1, bills.findByAccount("acct").stream()
+                .filter(bill -> bill.status() != com.github.cuixudong74.usagebillingpipelinejava.model.BillStatus.SUPERSEDED)
+                .count());
+        assertEquals(adjusted, afterSecondRecovery);
+        assertEquals("COMMITTED", secondRecovery.get(RecoveryStateStore.key("acct", JAN, FEB)));
     }
 }
